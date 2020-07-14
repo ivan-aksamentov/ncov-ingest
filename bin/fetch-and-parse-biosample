@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""
+Download and parse BioSample records for the BioSample accessions provided
+in the GenBank JSON and load into biosample tsv file.
+"""
+import argparse
+from pathlib import Path
+from typing import List, Dict, Any
+import xmltodict
+import pandas as pd
+from Bio import Entrez
+
+BIOSAMPLE_COLUMNS = []
+Entrez.email = 'hello@nextstrain.org'
+
+def fetch_biosample_data(genbank_data: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Use the BioSample accessions in *genbank_data* to search and fetch
+    BioSample records for extra metadata.
+    """
+    search_db = 'biosample'
+    Entrez.email = 'hello@nextstrain.org'
+    
+    # Create search term with the BioSample accessions so that it has the
+    # format "<accession1>[accn] or <accession2>[accn] or <accession3>[accn]"
+    biosample_accessions = genbank_data['biosample_accession'] \
+                                .loc[lambda a: a != ''] \
+                                .astype(str) + '[accn]'
+    search_term = biosample_accessions.str.cat(sep=' or ')
+    
+    # Search using the Entrez History Server to temporarily store the UIDs 
+    # on the server, so we don't have to round-trip the UIDs.
+    search_history = Entrez.read(Entrez.esearch(usehistory='y', db=search_db, term=search_term))
+    # Fetch BioSample records using the stored UIDs on the server
+    # The stored UIDs are accessed via QueryKey & WebEnv returned by ESearch.
+    efetch_result = Entrez.efetch(db=search_db,
+                                  query_key = search_history['QueryKey'],
+                                  WebEnv = search_history['WebEnv'])
+    # Entrez.read() currently does not work with BioSample XMLs because they
+    # do not have a properly formatted DTD. So we need to parse the XML ourselves.
+    # Convert the returned XML to dict for easier data access
+    biosample_data = xmltodict.parse(efetch_result)
+
+    return biosample_data['BioSampleSet']['BioSample']
+    
+
+def parse_biosample_data(biosample_data: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Parse the *biosample_data* to create a DataFrame with all the
+    BIOSAMPLE_COLUMNS, with each row representing a single BioSample record.
+    """
+    biosample_records: List[Dict[str, str]] = []
+
+    for biosample in biosample_data:
+        record: Dict[str,str] = {}
+        record['biosample_accession'] = biosample['@accession']
+
+        biosample_records.append(record)
+
+    return pd.DataFrame(biosample_records)
+
+
+if __name__ == '__main__':
+    base = Path(__file__).resolve().parent.parent
+
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("genbank_data",
+        default="s3://nextstrain-data/ncov-ingest/genbank.ndjson.gz",
+        nargs="?",
+        help="Newline-delimited GenBank JSON data")  
+    parser.add_argument("--output-biosample",
+        default=base / "data/genbank/biosample.tsv",
+        help="Output location of generated biosample tsv. Defaults to `data/genbank/biosample.tsv`")
+    args = parser.parse_args()
+
+    genbank_data = pd.read_json(args.genbank_data,
+                                lines=True,
+                                compression='infer')
+
+    biosample_data = fetch_biosample_data(genbank_data)
+    biosample_data = parse_biosample_data(biosample_data)
+
+    biosample_data.to_csv(args.output_biosample, sep='\t', na_rep='', index=False)
